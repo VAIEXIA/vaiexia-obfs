@@ -3,49 +3,140 @@
 //! Wraps the pure state machines in [`vaiexia_wire::handshake::Handshake`] and
 //! drives the 3-message exchange over any `AsyncRead + AsyncWrite` stream.
 //!
-//! Message framing during the handshake uses a simple 2-byte big-endian length
-//! prefix (handshake messages are well under 65535 bytes).
+//! # Preamble junk
+//! When a [`MimicryProfile`] has a non-zero `preamble_junk_len`, the **sender**
+//! (always the client / initiator) writes that many random bytes before the
+//! first handshake frame.  The **receiver** (server / responder) reads and
+//! discards exactly `profile.preamble_skip()` bytes before parsing frames.
+//!
+//! Both sides must be configured with the same profile (out-of-band), so the
+//! receiver knows exactly how many bytes to skip — there is no in-band length.
+//!
+//! # Message framing
+//! The 3 XK messages are sent / received via `send_raw` / `recv_raw` in
+//! [`crate::framing`] so they are shaped by the active profile exactly like
+//! transport records, but without session encryption (Noise messages are
+//! already cryptographically random).
 
 use crate::{ObfsError, Result};
+use crate::framing::{recv_raw, send_raw};
+use rand::{SeedableRng, rngs::SmallRng};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use vaiexia_wire::{handshake::Handshake, session::Session};
+use vaiexia_wire::{handshake::Handshake, mimicry::MimicryProfile, session::Session};
 
-/// Write a single handshake message with a 2-byte big-endian length prefix.
-pub async fn write_hs_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &[u8]) -> Result<()> {
-    let len = msg.len() as u16;
-    w.write_all(&len.to_be_bytes()).await?;
-    w.write_all(msg).await?;
-    Ok(())
+// ── Profile-aware in-place variants (used by client.rs / server.rs) ──────────
+
+/// Drive the **initiator** (client) side of the Noise-XK handshake **in-place**
+/// on a mutable reference, using `profile` for preamble + message framing.
+///
+/// - Writes `profile.preamble(...)` bytes to the socket first.
+/// - Sends all 3 XK messages via `send_raw` / `recv_raw`.
+/// - Returns `(Session, leftover_buf)`.  `leftover_buf` holds any bytes already
+///   read from the socket beyond msg2.  Pass it as the initial pump read buffer.
+pub async fn client_handshake_in_place<S>(
+    io: &mut S,
+    local_private: &[u8; 32],
+    remote_public: &[u8; 32],
+    profile: &Arc<dyn MimicryProfile>,
+) -> Result<(Session, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut rng = SmallRng::from_entropy();
+    let mut hs = Handshake::initiator(local_private, remote_public)?;
+    let mut buf = Vec::new();
+
+    // Preamble junk (client always sends it).
+    let mut preamble = Vec::new();
+    profile.preamble(&mut preamble, &mut rng);
+    if !preamble.is_empty() {
+        io.write_all(&preamble).await?;
+        io.flush().await?;
+    }
+
+    // msg1: initiator → responder  (e, es)
+    let m1 = hs.write_message(b"")?;
+    send_raw(io, profile.as_ref(), &mut rng, &m1).await?;
+
+    // msg2: responder → initiator  (e, ee)
+    let m2 = recv_raw(io, profile.as_ref(), &mut buf).await?;
+    hs.read_message(&m2)?;
+
+    // msg3: initiator → responder  (s, se)
+    let m3 = hs.write_message(b"")?;
+    send_raw(io, profile.as_ref(), &mut rng, &m3).await?;
+
+    // Return leftover bytes (normally empty; server can't send before msg3 in XK).
+    Ok((hs.into_session()?, buf))
 }
 
-/// Read a single handshake message (2-byte length prefix).
-pub async fn read_hs_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 2];
-    match r.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(ObfsError::Closed);
+/// Drive the **responder** (server) side of the Noise-XK handshake **in-place**
+/// on a mutable reference, using `profile` for preamble skip + message framing.
+///
+/// - Reads and discards exactly `profile.preamble_skip()` bytes first.
+/// - Receives all 3 XK messages via `send_raw` / `recv_raw`.
+/// - Returns `(Session, remote_static, leftover_buf)`.  `leftover_buf` holds
+///   any bytes that were read from the socket beyond what the handshake needed.
+///   The caller MUST pass this as the initial contents of its read buffer so
+///   that frames sent by the peer immediately after the handshake (before the
+///   server loop started) are not silently discarded.
+pub async fn server_handshake_in_place<S>(
+    io: &mut S,
+    local_private: &[u8; 32],
+    profile: &Arc<dyn MimicryProfile>,
+) -> Result<(Session, Option<[u8; 32]>, Vec<u8>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut rng = SmallRng::from_entropy();
+    let mut hs = Handshake::responder(local_private)?;
+    let mut buf = Vec::new();
+
+    // Skip preamble junk the client sent.
+    let skip = profile.preamble_skip();
+    if skip > 0 {
+        let mut discard = vec![0u8; skip];
+        match io.read_exact(&mut discard).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(ObfsError::Closed);
+            }
+            Err(e) => return Err(ObfsError::Io(e)),
         }
-        Err(e) => return Err(ObfsError::Io(e)),
     }
-    let len = u16::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    match r.read_exact(&mut buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(ObfsError::Closed);
-        }
-        Err(e) => return Err(ObfsError::Io(e)),
-    }
-    Ok(buf)
+
+    // msg1: initiator → responder  (e, es)
+    let m1 = recv_raw(io, profile.as_ref(), &mut buf).await?;
+    hs.read_message(&m1)?;
+
+    // msg2: responder → initiator  (e, ee)
+    let m2 = hs.write_message(b"")?;
+    send_raw(io, profile.as_ref(), &mut rng, &m2).await?;
+
+    // msg3: initiator → responder  (s, se)
+    let m3 = recv_raw(io, profile.as_ref(), &mut buf).await?;
+    hs.read_message(&m3)?;
+
+    let remote_static = hs.remote_static();
+    let session = hs.into_session()?;
+    // Return `buf` to the caller — any bytes already read beyond msg3
+    // (e.g. the first transport frame sent by the client) must not be lost.
+    Ok((session, remote_static, buf))
 }
+
+// ── Vanilla (profile-free) variants — kept for unit tests ────────────────────
+
+use vaiexia_wire::mimicry::Vanilla;
 
 /// Drive the **initiator** (client) side of the Noise-XK handshake.
 ///
-/// Sends msg1, receives msg2, sends msg3, then returns the post-handshake
-/// [`Session`].
+/// Takes ownership of `io`; returns the post-handshake [`Session`].
+/// Uses Vanilla framing (no preamble, no padding).
 ///
-/// `remote_public` is the server's known static public key (the "K" in XK).
+/// # Note
+/// Prefer [`client_handshake_in_place`] in production code so the stream
+/// remains available after the handshake.
 pub async fn client_handshake<S>(
     mut io: S,
     local_private: &[u8; 32],
@@ -54,28 +145,20 @@ pub async fn client_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut hs = Handshake::initiator(local_private, remote_public)?;
-
-    // msg1: initiator → responder  (e, es)
-    let m1 = hs.write_message(b"")?;
-    write_hs_msg(&mut io, &m1).await?;
-
-    // msg2: responder → initiator  (e, ee)
-    let m2 = read_hs_msg(&mut io).await?;
-    hs.read_message(&m2)?;
-
-    // msg3: initiator → responder  (s, se)
-    let m3 = hs.write_message(b"")?;
-    write_hs_msg(&mut io, &m3).await?;
-
-    let session = hs.into_session()?;
+    let profile: Arc<dyn MimicryProfile> = Arc::new(Vanilla::new(Default::default()));
+    let (session, _leftover) =
+        client_handshake_in_place(&mut io, local_private, remote_public, &profile).await?;
     Ok(session)
 }
 
 /// Drive the **responder** (server) side of the Noise-XK handshake.
 ///
-/// Receives msg1, sends msg2, receives msg3, then returns the post-handshake
-/// [`Session`].
+/// Takes ownership of `io`; returns the post-handshake [`Session`].
+/// Uses Vanilla framing (no preamble, no padding).
+///
+/// # Note
+/// Prefer [`server_handshake_in_place`] in production code so the stream
+/// remains available after the handshake.
 pub async fn server_handshake<S>(
     mut io: S,
     local_private: &[u8; 32],
@@ -83,83 +166,19 @@ pub async fn server_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut hs = Handshake::responder(local_private)?;
-
-    // msg1: initiator → responder  (e, es)
-    let m1 = read_hs_msg(&mut io).await?;
-    hs.read_message(&m1)?;
-
-    // msg2: responder → initiator  (e, ee)
-    let m2 = hs.write_message(b"")?;
-    write_hs_msg(&mut io, &m2).await?;
-
-    // msg3: initiator → responder  (s, se)
-    let m3 = read_hs_msg(&mut io).await?;
-    hs.read_message(&m3)?;
-
-    let session = hs.into_session()?;
+    let profile: Arc<dyn MimicryProfile> = Arc::new(Vanilla::new(Default::default()));
+    let (session, _, _leftover) =
+        server_handshake_in_place(&mut io, local_private, &profile).await?;
     Ok(session)
 }
 
-/// Drive the **initiator** side of the Noise-XK handshake **in-place** on a
-/// mutable reference.
-///
-/// Unlike [`client_handshake`], this borrows the I/O object so the caller
-/// retains ownership for subsequent framed communication.
-pub async fn client_handshake_in_place<S>(
-    io: &mut S,
-    local_private: &[u8; 32],
-    remote_public: &[u8; 32],
-) -> Result<Session>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut hs = Handshake::initiator(local_private, remote_public)?;
-
-    let m1 = hs.write_message(b"")?;
-    write_hs_msg(io, &m1).await?;
-
-    let m2 = read_hs_msg(io).await?;
-    hs.read_message(&m2)?;
-
-    let m3 = hs.write_message(b"")?;
-    write_hs_msg(io, &m3).await?;
-
-    Ok(hs.into_session()?)
-}
-
-/// Drive the **responder** side of the Noise-XK handshake **in-place** on a
-/// mutable reference.
-///
-/// Unlike [`server_handshake`], this borrows the I/O object so the caller
-/// retains ownership for subsequent framed communication.
-pub async fn server_handshake_in_place<S>(
-    io: &mut S,
-    local_private: &[u8; 32],
-) -> Result<(Session, Option<[u8; 32]>)>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut hs = Handshake::responder(local_private)?;
-
-    let m1 = read_hs_msg(io).await?;
-    hs.read_message(&m1)?;
-
-    let m2 = hs.write_message(b"")?;
-    write_hs_msg(io, &m2).await?;
-
-    let m3 = read_hs_msg(io).await?;
-    hs.read_message(&m3)?;
-
-    let remote_static = hs.remote_static();
-    let session = hs.into_session()?;
-    Ok((session, remote_static))
-}
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use vaiexia_wire::keypair::generate_keypair;
+    use vaiexia_wire::mimicry::{AmneziaJunk, MimicryConfig};
 
     /// A full Noise-XK handshake over a duplex pipe completes on both sides.
     #[tokio::test]
@@ -225,18 +244,55 @@ mod tests {
         let client_kp = generate_keypair().unwrap();
 
         let (mut client_io, mut server_io) = tokio::io::duplex(4096);
+        let profile: Arc<dyn MimicryProfile> = Arc::new(Vanilla::new(Default::default()));
 
         let (cs, ss_pair) = tokio::join!(
-            client_handshake_in_place(&mut client_io, &client_kp.private, &server_kp.public),
-            server_handshake_in_place(&mut server_io, &server_kp.private),
+            client_handshake_in_place(&mut client_io, &client_kp.private, &server_kp.public, &profile),
+            server_handshake_in_place(&mut server_io, &server_kp.private, &profile),
         );
 
-        let mut cs = cs.unwrap();
-        let (mut ss, remote_key) = ss_pair.unwrap();
+        let (mut cs, _) = cs.unwrap();
+        let (mut ss, remote_key, _leftover) = ss_pair.unwrap();
 
         assert_eq!(remote_key.unwrap(), client_kp.public);
 
         let ct = cs.encrypt(b"in-place test").unwrap();
         assert_eq!(ss.decrypt(&ct).unwrap(), b"in-place test");
+    }
+
+    /// Preamble junk + profile-shaped handshake with AmneziaJunk, non-zero magic.
+    /// Both sides complete and the sessions interop.
+    #[tokio::test]
+    async fn amnezia_preamble_shaped_handshake() {
+        let server_kp = generate_keypair().unwrap();
+        let client_kp = generate_keypair().unwrap();
+
+        let (mut client_io, mut server_io) = tokio::io::duplex(65536);
+
+        let profile: Arc<dyn MimicryProfile> = Arc::new(AmneziaJunk::new(MimicryConfig {
+            magic_header: [0xCA, 0xFE, 0xBA, 0xBE],
+            preamble_junk_len: 17,
+            pad_bucket: 64,
+            jitter_ms: (0, 0),
+        }));
+
+        let (cs, ss_pair) = tokio::join!(
+            client_handshake_in_place(
+                &mut client_io,
+                &client_kp.private,
+                &server_kp.public,
+                &profile,
+            ),
+            server_handshake_in_place(&mut server_io, &server_kp.private, &profile),
+        );
+
+        let (mut cs, _) = cs.unwrap();
+        let (mut ss, remote_key, _leftover) = ss_pair.unwrap();
+
+        assert_eq!(remote_key.unwrap(), client_kp.public);
+
+        // Sessions can encrypt/decrypt after the profile-shaped handshake.
+        let ct = cs.encrypt(b"preamble works").unwrap();
+        assert_eq!(ss.decrypt(&ct).unwrap(), b"preamble works");
     }
 }
