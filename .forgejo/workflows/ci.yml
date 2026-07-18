@@ -1,0 +1,45 @@
+# CI for vaiexia-obfs (Forgejo / Gitea)
+#
+# NOTE: This crate uses path dependencies on ../vaiexia-core and ../vaiexia-wire.
+# CI must check out all three sibling repos at the correct relative paths.
+
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout vaiexia-obfs
+        uses: actions/checkout@v4
+        with:
+          path: vaiexia-obfs
+
+      - name: Checkout vaiexia-core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/vaiexia-core
+          path: vaiexia-core
+
+      - name: Checkout vaiexia-wire
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/vaiexia-wire
+          path: vaiexia-wire
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test
+        working-directory: vaiexia-obfs
+        run: cargo test --locked
+
+      - name: cargo build --release
+        working-directory: vaiexia-obfs
+        run: cargo build --release --locked
