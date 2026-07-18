@@ -4,6 +4,9 @@
 //! - RPC request / response round-trips.
 //! - Server-pushed events on subscribed topics.
 //! - `Connection::state()` reports `Connected`.
+//!
+//! All tests use a Vanilla profile (no obfuscation) to preserve Phase-2b
+//! baseline behaviour.
 
 use std::sync::Arc;
 use tokio::time::{timeout, Duration};
@@ -14,7 +17,7 @@ use vaiexia_core::server::ServiceBuilder;
 use vaiexia_core::transport::{Connection, ConnectionState, Requester, Subscriber};
 use vaiexia_core::version::ProtoVersion;
 use vaiexia_wire::keypair::generate_keypair;
-use vaiexia_obfs::{serve_obfs, AllowAll, ObfsTransport};
+use vaiexia_obfs::{serve_obfs, AllowAll, ObfsTransport, Vanilla, MimicryConfig};
 use futures_util::StreamExt;
 
 // ── test verifier ─────────────────────────────────────────────────────────────
@@ -36,6 +39,10 @@ impl Verifier for AllowAllVerifier {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+fn vanilla_profile() -> Arc<dyn vaiexia_obfs::MimicryProfile> {
+    Arc::new(Vanilla::new(MimicryConfig::default()))
+}
+
 async fn start_server(
     service: Arc<vaiexia_core::server::Service>,
     server_kp: &vaiexia_wire::keypair::StaticKeypair,
@@ -45,6 +52,7 @@ async fn start_server(
         server_kp.private,
         service,
         Arc::new(AllowAll),
+        vanilla_profile(),
     )
     .await
     .expect("server should bind")
@@ -73,6 +81,7 @@ async fn loopback_request_and_response() {
         handle.local_addr(),
         client_kp.private,
         server_kp.public,
+        vanilla_profile(),
     )
     .await
     .expect("client should connect");
@@ -114,6 +123,7 @@ async fn loopback_request_and_event() {
         handle.local_addr(),
         client_kp.private,
         server_kp.public,
+        vanilla_profile(),
     )
     .await
     .expect("client should connect");
@@ -172,6 +182,7 @@ async fn connection_state_is_connected() {
         handle.local_addr(),
         client_kp.private,
         server_kp.public,
+        vanilla_profile(),
     )
     .await
     .expect("client should connect");
@@ -194,6 +205,7 @@ async fn wrong_server_key_connection_fails() {
             handle.local_addr(),
             client_kp.private,
             wrong_kp.public, // wrong key
+            vanilla_profile(),
         ),
     )
     .await

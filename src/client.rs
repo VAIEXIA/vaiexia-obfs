@@ -14,11 +14,18 @@
 //! - **Events**: the pump broadcasts every received [`Event`] via a
 //!   `broadcast::Sender<Event>`; subscribers wrap a receiver in
 //!   `dedup_by_seq` to filter and deduplicate.
+//!
+//! # Mimicry
+//! `connect` accepts an `Arc<dyn MimicryProfile>`.  Pass
+//! `Arc::new(Vanilla::new(Default::default()))` for the Vanilla (no-op)
+//! profile — identical to Phase-2b behaviour.  Use `AmneziaJunk` for
+//! DPI-resistance.
 
 use crate::envelope::Envelope;
-use crate::framing::{read_frame, write_frame};
+use crate::framing::{recv_frame, send_frame};
 use crate::handshake_io::client_handshake_in_place;
 use async_trait::async_trait;
+use rand::{SeedableRng, rngs::SmallRng};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
@@ -26,6 +33,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use vaiexia_core::error::{CoreError, Result};
 use vaiexia_core::protocol::{Event, Request, Response, Topic};
 use vaiexia_core::transport::{Connection, ConnectionState, EventStream, Requester, Subscriber};
+use vaiexia_wire::mimicry::MimicryProfile;
+use vaiexia_wire::session::Session;
 
 type PendingMap = Mutex<HashMap<String, oneshot::Sender<Response>>>;
 
@@ -48,15 +57,23 @@ impl ObfsTransport {
     /// Connect to a Noise-XK server and perform the handshake.
     ///
     /// `server_public` is the server's known static public key.
+    /// `profile` controls the byte-stream framing; use
+    /// `Arc::new(Vanilla::new(Default::default()))` for no obfuscation.
     pub async fn connect(
         addr: impl tokio::net::ToSocketAddrs,
         local_private: [u8; 32],
         server_public: [u8; 32],
+        profile: Arc<dyn MimicryProfile>,
     ) -> crate::Result<Self> {
         let mut stream = TcpStream::connect(addr).await?;
 
-        let session =
-            client_handshake_in_place(&mut stream, &local_private, &server_public).await?;
+        let (session, leftover) = client_handshake_in_place(
+            &mut stream,
+            &local_private,
+            &server_public,
+            &profile,
+        )
+        .await?;
 
         let (ev_tx, _) = broadcast::channel::<Event>(256);
         let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
@@ -68,7 +85,7 @@ impl ObfsTransport {
         let ev_tx2 = ev_tx.clone();
         let pending2 = Arc::clone(&pending);
         let state2 = Arc::clone(&state);
-        tokio::spawn(pump(stream, session, rx, ev_tx2, pending2, state2));
+        tokio::spawn(pump(stream, session, leftover, rx, ev_tx2, pending2, state2, profile));
 
         Ok(Self {
             tx,
@@ -81,30 +98,44 @@ impl ObfsTransport {
 
 /// The background pump task.
 ///
-/// Owns the `TcpStream` and `Session` for their lifetimes. On any I/O error
+/// Owns the `TcpStream` and `Session` for their lifetimes.  Applies
+/// `profile.jitter()` before each outbound write.  On any I/O error
 /// it marks the state as `Down`, drains pending requests (causing their
 /// receivers to see a disconnection error), and exits.
 async fn pump(
     mut stream: TcpStream,
-    mut session: vaiexia_wire::session::Session,
+    mut session: Session,
+    initial_buf: Vec<u8>,
     mut outbound: mpsc::UnboundedReceiver<Envelope>,
     events: broadcast::Sender<Event>,
     pending: Arc<PendingMap>,
     state: Arc<Mutex<ConnectionState>>,
+    profile: Arc<dyn MimicryProfile>,
 ) {
+    let mut rng = SmallRng::from_entropy();
+    let mut buf = initial_buf;
+
     loop {
         tokio::select! {
             biased;
 
             // ── outbound frame ────────────────────────────────────────────────
             Some(env) = outbound.recv() => {
-                if write_frame(&mut stream, &mut session, &env).await.is_err() {
+                // Apply jitter before writing.
+                let delay = profile.jitter(&mut rng);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                if send_frame(&mut stream, &mut session, &env, profile.as_ref(), &mut rng)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
 
             // ── inbound frame from server ─────────────────────────────────────
-            result = read_frame(&mut stream, &mut session) => {
+            result = recv_frame(&mut stream, &mut session, profile.as_ref(), &mut buf) => {
                 match result {
                     Err(_) => break,
                     Ok(Envelope::Response(resp)) => {
@@ -119,7 +150,18 @@ async fn pump(
                     }
                     Ok(Envelope::Ping) => {
                         // Server-initiated ping; reply with pong.
-                        let _ = write_frame(&mut stream, &mut session, &Envelope::Pong).await;
+                        let delay = profile.jitter(&mut rng);
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let _ = send_frame(
+                            &mut stream,
+                            &mut session,
+                            &Envelope::Pong,
+                            profile.as_ref(),
+                            &mut rng,
+                        )
+                        .await;
                     }
                     Ok(Envelope::Pong) => {} // response to our ping
                     Ok(_) => {}              // ignore unexpected envelopes

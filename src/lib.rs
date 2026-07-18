@@ -10,6 +10,10 @@ pub use envelope::Envelope;
 pub use server::{serve_obfs, ObfsServeHandle};
 pub use verifier::{AllowAll, TransportGate};
 
+// Re-export mimicry types so callers can build profiles without a direct
+// vaiexia-wire dependency in their Cargo.toml.
+pub use vaiexia_wire::mimicry::{AmneziaJunk, MimicryConfig, MimicryProfile, Vanilla};
+
 #[derive(Debug, thiserror::Error)]
 pub enum ObfsError {
     #[error("connection closed")]
