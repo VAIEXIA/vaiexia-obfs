@@ -1,0 +1,22 @@
+[package]
+name = "vaiexia-obfs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "VAIEXIA obfuscated transport — Noise-XK encrypted TCP framing over vaiexia-core RPC"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+vaiexia-core = { path = "../vaiexia-core", features = ["ws"] }
+vaiexia-wire = { path = "../vaiexia-wire" }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
+futures = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-stream = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
