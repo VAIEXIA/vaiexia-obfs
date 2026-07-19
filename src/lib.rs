@@ -2,6 +2,7 @@ pub mod client;
 pub mod envelope;
 pub mod framing;
 pub mod handshake_io;
+pub mod proxy;
 pub mod server;
 pub mod verifier;
 

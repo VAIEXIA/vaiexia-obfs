@@ -60,12 +60,19 @@ impl ObfsTransport {
     /// `profile` controls the byte-stream framing; use
     /// `Arc::new(Vanilla::new(Default::default()))` for no obfuscation.
     pub async fn connect(
-        addr: impl tokio::net::ToSocketAddrs,
+        addr: impl tokio::net::ToSocketAddrs + std::fmt::Display,
         local_private: [u8; 32],
         server_public: [u8; 32],
         profile: Arc<dyn MimicryProfile>,
+        proxy: Option<vaiexia_core::transport::proxy::ProxyConfig>,
     ) -> crate::Result<Self> {
-        let mut stream = TcpStream::connect(addr).await?;
+        let mut stream = if let Some(proxy_cfg) = proxy {
+            let addr_str = addr.to_string();
+            let (host, port) = crate::proxy::parse_addr(&addr_str)?;
+            crate::proxy::dial(&proxy_cfg, &host, port).await?
+        } else {
+            TcpStream::connect(addr).await?
+        };
 
         let (session, leftover) = client_handshake_in_place(
             &mut stream,

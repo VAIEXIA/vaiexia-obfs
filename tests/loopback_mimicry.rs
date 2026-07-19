@@ -105,6 +105,7 @@ async fn loopback_amnezia_ping_and_event() {
         client_kp.private,
         server_kp.public,
         amnezia_profile(),
+        None,
     )
     .await
     .expect("client should connect under AmneziaJunk");
