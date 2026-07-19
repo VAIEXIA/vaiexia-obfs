@@ -102,6 +102,75 @@ let transport = ObfsTransport::connect(
 let response = transport.request(req).await?;
 ```
 
+## Proxy support (Phase 4)
+
+`ObfsTransport::connect` accepts an optional `ProxyConfig` (from
+`vaiexia-core`) to route the TCP connection through one or more proxy hops
+before the Noise-XK handshake begins.
+
+### Supported protocols
+
+| Kind | RFC | Auth |
+|------|-----|------|
+| SOCKS5 | RFC 1928 + RFC 1929 | username/password (optional) |
+| HTTP CONNECT | RFC 7231 §4.3.6 | `Proxy-Authorization: Basic` (optional) |
+
+### Single-hop SOCKS5
+
+```rust
+use vaiexia_core::transport::proxy::{ProxyAuth, ProxyConfig, ProxyKind};
+
+let proxy = ProxyConfig {
+    kind: ProxyKind::Socks5,
+    addr: "127.0.0.1:1080".to_string(),
+    auth: Some(ProxyAuth { user: "alice".into(), pass: "s3cr3t".into() }),
+    chain: vec![],
+};
+
+let client = ObfsTransport::connect(
+    "10.0.0.1:4433",
+    client_kp.private,
+    server_public,
+    profile,
+    Some(proxy),
+).await?;
+```
+
+### Single-hop HTTP CONNECT
+
+```rust
+let proxy = ProxyConfig {
+    kind: ProxyKind::HttpConnect,
+    addr: "proxy.example.com:3128".to_string(),
+    auth: None,
+    chain: vec![],
+};
+```
+
+### Multi-hop chain (SOCKS5 → SOCKS5)
+
+```rust
+use vaiexia_core::transport::proxy::ProxyHop;
+
+let proxy = ProxyConfig {
+    kind: ProxyKind::Socks5,
+    addr: "10.0.0.1:1080".to_string(),   // first hop
+    auth: None,
+    chain: vec![
+        ProxyHop {
+            kind: ProxyKind::Socks5,
+            addr: "10.0.0.2:1080".to_string(),  // second hop
+            auth: None,
+        },
+    ],
+};
+// Traffic path: client → proxy1 → proxy2 → obfs server
+```
+
+`chain` entries can mix kinds freely (e.g. SOCKS5 → HTTP CONNECT).
+The Noise-XK handshake and all subsequent traffic are tunnelled through
+the full chain — the proxies see only opaque bytes.
+
 ## snow 64 KiB limit
 
 The ChaCha20Poly1305 implementation (snow) caps each transport message at
