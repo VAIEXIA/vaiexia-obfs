@@ -4,6 +4,7 @@ pub mod framing;
 pub mod handshake_io;
 pub mod proxy;
 pub mod server;
+pub mod udp;
 pub mod verifier;
 
 pub use client::ObfsTransport;
@@ -29,6 +30,10 @@ pub enum ObfsError {
     Serde(#[from] serde_json::Error),
     #[error("core error: {0}")]
     Core(#[from] vaiexia_core::error::CoreError),
+    #[error("handshake failed: {0}")]
+    HandshakeFailed(String),
+    #[error("operation timed out")]
+    Timeout,
 }
 
 pub type Result<T> = std::result::Result<T, ObfsError>;
