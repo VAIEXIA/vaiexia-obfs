@@ -13,7 +13,7 @@ pub use server::{serve_obfs, ObfsServeHandle};
 pub use verifier::{AllowAll, TransportGate};
 
 pub use udp::client::{connect_udp, UdpObfsTransport};
-pub use udp::cookie_gate::{AlwaysOpen, AlwaysUnderLoad, LoadGate, Threshold};
+pub use udp::cookie_gate::{AlwaysOpen, AlwaysUnderLoad, LoadGate};
 pub use udp::server::{serve_obfs_udp, UdpServeHandle};
 
 // Re-export mimicry types so callers can build profiles without a direct

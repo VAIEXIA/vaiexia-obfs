@@ -197,11 +197,13 @@ async fn handle_dgram(
         DgramType::Hs1 => {
             if peers.len() >= MAX_PEERS { return; }
 
-            // Treat pending-handshake pressure as "under load" so the cookie
-            // challenge engages even when the injected LoadGate is not wired to
-            // this map. A spoofed-source flood then cannot allocate Noise
-            // responder state without first echoing a src-bound cookie it can
-            // only obtain by actually receiving our reply at that source.
+            // The cookie challenge engages on EITHER the operator override
+            // (`LoadGate`, for signals the server can't observe: CPU, fds,
+            // admin panic switch) OR internal pending-handshake pressure —
+            // the built-in flood defence. A spoofed-source flood then cannot
+            // allocate Noise responder state without first echoing a
+            // src-bound cookie it can only obtain by actually receiving our
+            // reply at that source.
             let effective_under_load =
                 load.under_load() || pending.len() >= PENDING_SOFT_LIMIT;
             let eff_gate: &dyn LoadGate =

@@ -201,18 +201,24 @@ Message 1 and 3 are retransmitted on a timer; the whole handshake is bounded
 
 ### DoS cookie gating
 
-`serve_obfs_udp` takes a `LoadGate`:
+The cookie challenge is **self-triggering**: once the server's half-open
+handshake map reaches an internal soft limit, every new `Hs1` is challenged —
+no external wiring needed. `serve_obfs_udp` additionally takes a `LoadGate`
+as an operator override for load signals the server cannot observe itself
+(CPU pressure, fd exhaustion, an admin panic switch):
 
 | Impl | Behaviour |
 |------|-----------|
-| `AlwaysOpen` | never under load — always allocate handshake state |
-| `AlwaysUnderLoad` | always challenge with a stateless cookie first |
-| `Threshold` | under load once in-flight handshakes exceed a bound |
+| `AlwaysOpen` | no override — challenge only on internal pending-handshake pressure |
+| `AlwaysUnderLoad` | force-cookie mode — challenge every first `Hs1` |
+
+The effective condition is `gate.under_load() || pending ≥ soft limit`.
 
 Under load the server replies to `Hs1` with a `Cookie` challenge (a keyed MAC
 over the client's `ip:port`) and allocates **no** state. The client echoes the
 cookie in a retried `Hs1`; only a verified cookie causes the server to run the
-Noise responder. Cookies survive one secret rotation.
+Noise responder. The cookie secret rotates every 120 s; a cookie survives
+exactly one rotation, bounding replay of a captured cookie to ~2 intervals.
 
 ### Data plane
 
