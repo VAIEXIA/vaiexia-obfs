@@ -101,10 +101,12 @@ async fn handle_connection(
         };
 
     // ── transport gate ───────────────────────────────────────────────────────
-    if let Some(key) = &remote_key {
-        if gate.authenticate(key).is_err() {
-            return;
-        }
+    // Fail closed: a completed XK handshake must yield the client's static key.
+    // If it is somehow absent we cannot authenticate the peer, so reject rather
+    // than run the pump on an unauthenticated connection.
+    match &remote_key {
+        Some(key) if gate.authenticate(key).is_ok() => {}
+        _ => return,
     }
 
     // ── post-handshake pump ──────────────────────────────────────────────────

@@ -10,7 +10,7 @@ use vaiexia_wire::mimicry::DatagramMimicry;
 use vaiexia_core::server::Service;
 
 use crate::envelope::Envelope;
-use crate::udp::cookie_gate::LoadGate;
+use crate::udp::cookie_gate::{AlwaysOpen, AlwaysUnderLoad, LoadGate};
 use crate::udp::dataplane::DataChannel;
 use crate::udp::handshake::{
     AcceptResult, process_hs1, complete_handshake_msg3,
@@ -21,6 +21,15 @@ use crate::Result;
 
 const MAX_DGRAM: usize = 65507;
 const MAX_PEERS: usize = 1024;
+/// Hard ceiling on half-open (pending) handshakes; caps memory under a flood.
+const MAX_PENDING: usize = 2048;
+/// Once this many handshakes are half-open, force the cookie challenge even if
+/// the injected `LoadGate` reports no load — this is the actual line of defence
+/// against a spoofed-source Hs1 flood allocating unbounded Noise state.
+const PENDING_SOFT_LIMIT: usize = 256;
+/// Peers idle longer than this are evicted so the MAX_PEERS budget can't be
+/// permanently exhausted by abandoned sessions.
+const PEER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 struct PendingHandshake {
     responder: vaiexia_wire::handshake::Handshake,
@@ -29,7 +38,6 @@ struct PendingHandshake {
 
 struct PeerState {
     channel: Arc<DataChannel>,
-    #[allow(dead_code)]
     last_seen: std::time::Instant,
     /// Events to send to this peer (drained by the per-peer sealer task).
     outbound_tx: mpsc::UnboundedSender<Envelope>,
@@ -145,9 +153,19 @@ async fn handle_dgram(
         DgramType::Hs1 => {
             if peers.len() >= MAX_PEERS { return; }
 
+            // Treat pending-handshake pressure as "under load" so the cookie
+            // challenge engages even when the injected LoadGate is not wired to
+            // this map. A spoofed-source flood then cannot allocate Noise
+            // responder state without first echoing a src-bound cookie it can
+            // only obtain by actually receiving our reply at that source.
+            let effective_under_load =
+                load.under_load() || pending.len() >= PENDING_SOFT_LIMIT;
+            let eff_gate: &dyn LoadGate =
+                if effective_under_load { &AlwaysUnderLoad } else { &AlwaysOpen };
+
             let result = {
                 let cs = cookie_secret.lock().unwrap();
-                process_hs1(&body, src, server_priv, &cs, load, profile, rng)
+                process_hs1(&body, src, server_priv, &cs, eff_gate, profile, rng)
             };
 
             match result {
@@ -155,6 +173,11 @@ async fn handle_dgram(
                     let _ = sock.send_to(&wire, src).await;
                 }
                 Ok(Some(AcceptResult::PartialHandshake { responder, msg2, .. })) => {
+                    // Hard cap: never let the pending map grow without bound,
+                    // even under a cookie-verified burst.
+                    if pending.len() >= MAX_PENDING && !pending.contains_key(&src) {
+                        return;
+                    }
                     pending.insert(src, PendingHandshake {
                         responder,
                         created_at: std::time::Instant::now(),
@@ -257,4 +280,7 @@ async fn handle_dgram(
     // Cleanup stale pending handshakes (>5s)
     let now = std::time::Instant::now();
     pending.retain(|_, ph| now.duration_since(ph.created_at) < std::time::Duration::from_secs(5));
+    // Evict idle peers so a finite MAX_PEERS budget can't be permanently wedged
+    // by abandoned sessions; dropping PeerState closes its outbound sealer task.
+    peers.retain(|_, p| now.duration_since(p.last_seen) < PEER_IDLE_TIMEOUT);
 }

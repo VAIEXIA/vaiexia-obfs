@@ -59,9 +59,12 @@ impl DataChannel {
             Ok(pt) => pt,
             Err(_) => return Ok(None), // auth failed or replay — drop silently
         };
-        // deserialize
-        let env = serde_json::from_slice(&plaintext)?;
-        Ok(Some(env))
+        // deserialize — malformed plaintext is dropped as None (per contract),
+        // never surfaced as Err (which would tear down the caller's pump loop).
+        match serde_json::from_slice(&plaintext) {
+            Ok(env) => Ok(Some(env)),
+            Err(_) => Ok(None),
+        }
     }
 }
 
