@@ -226,6 +226,9 @@ async fn recv_from_server(
 }
 
 /// Result of processing an inbound Hs1 datagram from a client.
+// Transient value, destructured immediately by the caller — boxing the large
+// `Handshake` variant would only add an allocation per accepted Hs1.
+#[allow(clippy::large_enum_variant)]
 pub enum AcceptResult {
     /// Send this cookie reply to the client, allocate no state.
     CookieReply(Vec<u8>),
@@ -492,17 +495,16 @@ mod tests {
                     Duration::from_millis(200),
                     server_sock2.recv_from(&mut buf)
                 ).await;
-                if let Ok(Ok((n, src))) = res {
-                    if let Some((DgramType::Hs1, body)) = unshape_hs(&buf[..n], &mimic2) {
-                        if let Ok(Some(result)) = process_hs1(&body, src, &server_priv, &cookie_secret, &load_gate, &mimic2, &mut rng) {
-                            match result {
-                                AcceptResult::PartialHandshake { msg2, .. } => {
-                                    let _ = server_sock2.send_to(&msg2, src).await;
-                                }
-                                AcceptResult::CookieReply(r) => {
-                                    let _ = server_sock2.send_to(&r, src).await;
-                                }
-                            }
+                if let Ok(Ok((n, src))) = res
+                    && let Some((DgramType::Hs1, body)) = unshape_hs(&buf[..n], &mimic2)
+                    && let Ok(Some(result)) = process_hs1(&body, src, &server_priv, &cookie_secret, &load_gate, &mimic2, &mut rng)
+                {
+                    match result {
+                        AcceptResult::PartialHandshake { msg2, .. } => {
+                            let _ = server_sock2.send_to(&msg2, src).await;
+                        }
+                        AcceptResult::CookieReply(r) => {
+                            let _ = server_sock2.send_to(&r, src).await;
                         }
                     }
                 }

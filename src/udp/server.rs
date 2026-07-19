@@ -238,37 +238,36 @@ async fn handle_dgram(
             let Some(ph) = pending.remove(&src) else { return };
             let mut responder = ph.responder;
 
-            match complete_handshake_msg3(&mut responder, &body, Arc::clone(profile)) {
-                Ok((channel, client_static)) => {
-                    if gate.authenticate(&client_static).is_err() { return; }
+            if let Ok((channel, client_static)) =
+                complete_handshake_msg3(&mut responder, &body, Arc::clone(profile))
+            {
+                if gate.authenticate(&client_static).is_err() { return; }
 
-                    let channel = Arc::new(channel);
-                    // Send ready record
-                    if let Ok(wire) = channel.seal_envelope(&Envelope::Pong, rng) {
-                        let _ = sock.send_to(&wire, src).await;
-                    }
-
-                    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Envelope>();
-                    let ch2 = Arc::clone(&channel);
-                    let out_tx2 = out_tx.clone();
-
-                    // Event sender task: seals Envelopes and forwards to the send loop.
-                    tokio::spawn(async move {
-                        let mut local_rng = SmallRng::from_entropy();
-                        while let Some(env) = ev_rx.recv().await {
-                            if let Ok(wire) = ch2.seal_envelope(&env, &mut local_rng) {
-                                let _ = out_tx2.send((src, wire));
-                            }
-                        }
-                    });
-
-                    peers.insert(src, PeerState {
-                        channel,
-                        last_seen: std::time::Instant::now(),
-                        outbound_tx: ev_tx,
-                    });
+                let channel = Arc::new(channel);
+                // Send ready record
+                if let Ok(wire) = channel.seal_envelope(&Envelope::Pong, rng) {
+                    let _ = sock.send_to(&wire, src).await;
                 }
-                Err(_) => {}
+
+                let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Envelope>();
+                let ch2 = Arc::clone(&channel);
+                let out_tx2 = out_tx.clone();
+
+                // Event sender task: seals Envelopes and forwards to the send loop.
+                tokio::spawn(async move {
+                    let mut local_rng = SmallRng::from_entropy();
+                    while let Some(env) = ev_rx.recv().await {
+                        if let Ok(wire) = ch2.seal_envelope(&env, &mut local_rng) {
+                            let _ = out_tx2.send((src, wire));
+                        }
+                    }
+                });
+
+                peers.insert(src, PeerState {
+                    channel,
+                    last_seen: std::time::Instant::now(),
+                    outbound_tx: ev_tx,
+                });
             }
         }
 

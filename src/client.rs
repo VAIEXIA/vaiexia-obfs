@@ -109,6 +109,7 @@ impl ObfsTransport {
 /// `profile.jitter()` before each outbound write.  On any I/O error
 /// it marks the state as `Down`, drains pending requests (causing their
 /// receivers to see a disconnection error), and exits.
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     mut stream: TcpStream,
     mut session: Session,
