@@ -171,6 +171,90 @@ let proxy = ProxyConfig {
 The Noise-XK handshake and all subsequent traffic are tunnelled through
 the full chain — the proxies see only opaque bytes.
 
+## Phase 5b — UDP substrate
+
+Alongside the TCP path, the crate provides a datagram-oriented UDP transport
+built on the `vaiexia-wire` record layer (`ChaCha20Poly1305` with an explicit
+counter) and a `DatagramMimicry` profile. It exposes:
+
+- **`connect_udp()` / `UdpObfsTransport`** — client transport implementing
+  core's `Requester`, `Subscriber`, and `Connection` traits over UDP.
+- **`serve_obfs_udp()` / `UdpServeHandle`** — server that demultiplexes peers
+  by source address, dispatches through a core `Service`, and gates clients via
+  a `TransportGate`.
+
+### Handshake
+
+A UDP-adapted Noise-XK exchange with client-driven retransmission:
+
+- `Hs1` (client → server): length-prefixed Noise msg1, optionally followed by a
+  16-byte DoS cookie.
+- `Hs2` (server → client): Noise msg2.
+- `Hs3` (client → server): Noise msg3 carrying a fresh 32-byte **seed** as its
+  encrypted payload. Both sides run BLAKE2s-keyed derivation on the seed to
+  obtain directional record keys (`c2s` / `s2c`).
+- The server sends an initial sealed `Pong` "ready" record; the client waits
+  for it to confirm the data channel is live.
+
+Message 1 and 3 are retransmitted on a timer; the whole handshake is bounded
+(a wrong server key fails fast rather than hanging).
+
+### DoS cookie gating
+
+`serve_obfs_udp` takes a `LoadGate`:
+
+| Impl | Behaviour |
+|------|-----------|
+| `AlwaysOpen` | never under load — always allocate handshake state |
+| `AlwaysUnderLoad` | always challenge with a stateless cookie first |
+| `Threshold` | under load once in-flight handshakes exceed a bound |
+
+Under load the server replies to `Hs1` with a `Cookie` challenge (a keyed MAC
+over the client's `ip:port`) and allocates **no** state. The client echoes the
+cookie in a retried `Hs1`; only a verified cookie causes the server to run the
+Noise responder. Cookies survive one secret rotation.
+
+### Data plane
+
+Each datagram is `[type u8][record]` shaped by the mimicry profile. The record
+opener enforces anti-replay internally (authenticate-before-replay) and
+tolerates reordering within its window, so out-of-order UDP delivery is fine.
+Unary requests are retransmitted client-side until the matching response
+arrives (server-side idempotency is assumed for v1).
+
+```rust
+use std::sync::Arc;
+use vaiexia_obfs::{serve_obfs_udp, connect_udp, AllowAll, AlwaysOpen};
+use vaiexia_wire::keypair::generate_keypair;
+use vaiexia_wire::mimicry::{Passthrough, MimicryConfig};
+
+let profile = Arc::new(Passthrough::new(MimicryConfig::default()));
+
+// Server
+let server_kp = generate_keypair()?;
+let handle = serve_obfs_udp(
+    "0.0.0.0:4433",
+    server_kp.clone(),
+    svc,
+    Arc::new(AllowAll),
+    Arc::new(AlwaysOpen),
+    Arc::clone(&profile),
+).await?;
+
+// Client
+let client_kp = generate_keypair()?;
+let transport = connect_udp(
+    handle.local_addr(),
+    server_kp.public,
+    client_kp,
+    profile,
+).await?;
+let response = transport.request(req).await?;
+```
+
+`QuicMimic` can be used in place of `Passthrough` to shape datagrams to
+resemble QUIC long-header packets; both peers must be configured identically.
+
 ## snow 64 KiB limit
 
 The ChaCha20Poly1305 implementation (snow) caps each transport message at
