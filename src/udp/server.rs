@@ -43,16 +43,62 @@ struct PeerState {
     outbound_tx: mpsc::UnboundedSender<Envelope>,
 }
 
-/// Handle returned by [`serve_obfs_udp`]; dropping it stops the server loop.
+/// Handle returned by [`serve_obfs_udp`]; dropping it stops the server loop
+/// and the periodic cookie-secret rotation task.
 pub struct UdpServeHandle {
     /// Local address the socket is bound to.
     pub local_addr: std::net::SocketAddr,
-    _stop: mpsc::Sender<()>,
+    recv_task: tokio::task::JoinHandle<()>,
+    rotate_task: tokio::task::JoinHandle<()>,
 }
 
 impl UdpServeHandle {
     pub fn local_addr(&self) -> std::net::SocketAddr { self.local_addr }
-    pub fn shutdown(&self) {}
+
+    /// Stop the server: aborts the recv loop and the cookie-rotation task.
+    /// Dropping the handle has the same effect.
+    pub fn shutdown(&self) {
+        self.recv_task.abort();
+        self.rotate_task.abort();
+    }
+}
+
+impl Drop for UdpServeHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Interval between cookie-secret rotations.
+///
+/// [`CookieSecret::verify`](vaiexia_wire::cookie::CookieSecret::verify) keeps a
+/// two-epoch grace (current OR previous), so a cookie minted up to one full
+/// interval before a rotation still verifies after it — in-flight `Hs1`
+/// retries are never orphaned by a rotation. Cookies older than two rotations
+/// are rejected, bounding the replay window to ~2x this interval.
+const COOKIE_ROTATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Spawn the periodic cookie-secret rotation task.
+///
+/// Returns the `JoinHandle` so the owner can abort it on shutdown. The seed is
+/// generated *before* taking the lock, and the lock is never held across an
+/// await point.
+fn spawn_cookie_rotation(
+    cookie_secret: Arc<Mutex<vaiexia_wire::cookie::CookieSecret>>,
+    every: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use rand::RngCore;
+        let mut rng = SmallRng::from_entropy();
+        let mut ticker = tokio::time::interval(every);
+        ticker.tick().await; // first tick completes immediately — skip it
+        loop {
+            ticker.tick().await;
+            let mut seed = [0u8; 32];
+            rng.fill_bytes(&mut seed);
+            cookie_secret.lock().unwrap().rotate(seed);
+        }
+    })
 }
 
 /// Bind a UDP server and start the recv loop.
@@ -66,7 +112,6 @@ pub async fn serve_obfs_udp(
 ) -> Result<UdpServeHandle> {
     let sock = Arc::new(UdpSocket::bind(addr).await?);
     let local_addr = sock.local_addr()?;
-    let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
 
     let server_priv = server_keypair.private;
     let cookie_seed: [u8; 32] = {
@@ -77,6 +122,10 @@ pub async fn serve_obfs_udp(
         b
     };
     let cookie_secret = Arc::new(Mutex::new(vaiexia_wire::cookie::CookieSecret::new(cookie_seed)));
+
+    // Rotate the cookie secret on a timer so a captured cookie is only
+    // replayable for a bounded window (two epochs ≈ 2x the interval).
+    let rotate_task = spawn_cookie_rotation(Arc::clone(&cookie_secret), COOKIE_ROTATE_INTERVAL);
 
     // Central (dst, datagram) outbound channel: per-peer sealer tasks push here,
     // a single send loop drains it and writes to the socket.
@@ -92,34 +141,29 @@ pub async fn serve_obfs_udp(
         }
     });
 
-    tokio::spawn(async move {
+    let recv_task = tokio::spawn(async move {
         let mut rng = SmallRng::from_entropy();
         let mut buf = vec![0u8; MAX_DGRAM];
         let mut pending: HashMap<SocketAddr, PendingHandshake> = HashMap::new();
         let mut peers: HashMap<SocketAddr, PeerState> = HashMap::new();
 
         loop {
-            tokio::select! {
-                _ = stop_rx.recv() => break,
-                result = sock2.recv_from(&mut buf) => {
-                    match result {
-                        Err(_) => break,
-                        Ok((n, src)) => {
-                            let dgram = buf[..n].to_vec();
-                            handle_dgram(
-                                dgram, src, &sock2, &out_tx,
-                                &server_priv, &service, &gate,
-                                load.as_ref(), &profile, &cookie_secret,
-                                &mut pending, &mut peers, &mut rng,
-                            ).await;
-                        }
-                    }
+            match sock2.recv_from(&mut buf).await {
+                Err(_) => break,
+                Ok((n, src)) => {
+                    let dgram = buf[..n].to_vec();
+                    handle_dgram(
+                        dgram, src, &sock2, &out_tx,
+                        &server_priv, &service, &gate,
+                        load.as_ref(), &profile, &cookie_secret,
+                        &mut pending, &mut peers, &mut rng,
+                    ).await;
                 }
             }
         }
     });
 
-    Ok(UdpServeHandle { local_addr, _stop: stop_tx })
+    Ok(UdpServeHandle { local_addr, recv_task, rotate_task })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -283,4 +327,106 @@ async fn handle_dgram(
     // Evict idle peers so a finite MAX_PEERS budget can't be permanently wedged
     // by abandoned sessions; dropping PeerState closes its outbound sealer task.
     peers.retain(|_, p| now.duration_since(p.last_seen) < PEER_IDLE_TIMEOUT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::Duration;
+    use vaiexia_wire::cookie::CookieSecret;
+
+    const SRC: &[u8] = b"203.0.113.7:51820";
+
+    /// A cookie minted just before a rotation must still verify just after it
+    /// (two-epoch grace), but a cookie two rotations old must be rejected.
+    #[tokio::test(start_paused = true)]
+    async fn cookie_survives_one_rotation_but_not_two() {
+        let cs = Arc::new(Mutex::new(CookieSecret::new([0x11; 32])));
+        let cookie = cs.lock().unwrap().make(SRC);
+
+        let task = spawn_cookie_rotation(Arc::clone(&cs), Duration::from_millis(100));
+
+        // t=150ms: exactly one rotation (at t=100ms) has happened.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            cs.lock().unwrap().verify(SRC, &cookie),
+            "cookie in flight across one rotation must still verify (previous epoch)"
+        );
+        // A cookie minted under the post-rotation current epoch also verifies.
+        let fresh = cs.lock().unwrap().make(SRC);
+        assert!(cs.lock().unwrap().verify(SRC, &fresh));
+
+        // t=250ms: a second rotation (at t=200ms) evicted the original epoch.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !cs.lock().unwrap().verify(SRC, &cookie),
+            "cookie two rotations old must be rejected"
+        );
+
+        task.abort();
+    }
+
+    /// Aborting the rotation task stops all further rotations.
+    #[tokio::test(start_paused = true)]
+    async fn aborted_rotation_task_stops_rotating() {
+        let cs = Arc::new(Mutex::new(CookieSecret::new([0x22; 32])));
+        let task = spawn_cookie_rotation(Arc::clone(&cs), Duration::from_millis(100));
+        task.abort();
+        let _ = task.await; // wait until the abort has landed
+
+        let cookie = cs.lock().unwrap().make(SRC);
+        // Many intervals later the cookie is still current-epoch valid: had the
+        // task kept rotating, two rotations would have evicted its epoch.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(cs.lock().unwrap().verify(SRC, &cookie));
+    }
+
+    /// `shutdown()` (and drop) abort both background tasks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_aborts_background_tasks() {
+        use vaiexia_core::auth::{Capability, ScopeSet, Subject, SubjectId, Verifier};
+        use vaiexia_core::protocol::Method;
+        use vaiexia_core::server::ServiceBuilder;
+
+        struct AllowAllVerifier;
+        impl Verifier for AllowAllVerifier {
+            fn verify(
+                &self,
+                _: Option<&Capability>,
+                _: &Method,
+            ) -> vaiexia_core::error::Result<Subject> {
+                Ok(Subject {
+                    id: SubjectId::new("test"),
+                    scopes: ScopeSet::from_iter(["*"]),
+                })
+            }
+        }
+
+        let kp = vaiexia_wire::keypair::generate_keypair().unwrap();
+        let svc = Arc::new(ServiceBuilder::new().verifier(AllowAllVerifier).build());
+        let profile: Arc<dyn DatagramMimicry> = Arc::new(
+            vaiexia_wire::mimicry::Passthrough::new(vaiexia_wire::mimicry::MimicryConfig::default()),
+        );
+
+        let handle = serve_obfs_udp(
+            "127.0.0.1:0",
+            kp,
+            svc,
+            Arc::new(crate::verifier::AllowAll),
+            Arc::new(AlwaysOpen),
+            profile,
+        )
+        .await
+        .expect("server should bind");
+
+        handle.shutdown();
+        // Aborts are asynchronous; poll until both tasks report finished.
+        for _ in 0..100 {
+            if handle.recv_task.is_finished() && handle.rotate_task.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("background tasks still running after shutdown()");
+    }
 }
