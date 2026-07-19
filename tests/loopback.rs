@@ -83,6 +83,7 @@ async fn loopback_request_and_response() {
         server_kp.public,
         vanilla_profile(),
         None,
+        None,
     )
     .await
     .expect("client should connect");
@@ -125,6 +126,7 @@ async fn loopback_request_and_event() {
         client_kp.private,
         server_kp.public,
         vanilla_profile(),
+        None,
         None,
     )
     .await
@@ -186,6 +188,7 @@ async fn connection_state_is_connected() {
         server_kp.public,
         vanilla_profile(),
         None,
+        None,
     )
     .await
     .expect("client should connect");
@@ -209,6 +212,7 @@ async fn wrong_server_key_connection_fails() {
             client_kp.private,
             wrong_kp.public, // wrong key
             vanilla_profile(),
+            None,
             None,
         ),
     )

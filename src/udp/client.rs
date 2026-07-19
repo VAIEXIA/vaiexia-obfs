@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::{timeout, Duration};
 use vaiexia_wire::keypair::StaticKeypair;
 use vaiexia_wire::mimicry::DatagramMimicry;
+use vaiexia_core::auth::Capability;
 use vaiexia_core::error::{CoreError, Result};
 use vaiexia_core::protocol::{Event, Request, Response, Topic};
 use vaiexia_core::transport::{Connection, ConnectionState, EventStream, Requester, Subscriber};
@@ -31,6 +32,8 @@ pub struct UdpObfsTransport {
     pending: Arc<PendingMap>,
     events: broadcast::Sender<Event>,
     state: Arc<Mutex<ConnectionState>>,
+    /// Optional capability attached to every `Subscribe` envelope.
+    capability: Option<Capability>,
 }
 
 impl UdpObfsTransport {
@@ -39,17 +42,22 @@ impl UdpObfsTransport {
         pending: Arc<PendingMap>,
         events: broadcast::Sender<Event>,
         state: Arc<Mutex<ConnectionState>>,
+        capability: Option<Capability>,
     ) -> Self {
-        Self { outbound_tx, pending, events, state }
+        Self { outbound_tx, pending, events, state, capability }
     }
 }
 
 /// Connect to a UDP server and perform the Noise-XK handshake.
+///
+/// `capability` is an optional bearer token attached to every `Subscribe`
+/// envelope so the server can gate per-topic access.
 pub async fn connect_udp(
     addr: impl tokio::net::ToSocketAddrs + std::fmt::Display,
     server_pub: [u8; 32],
     client_keypair: StaticKeypair,
     profile: Arc<dyn DatagramMimicry>,
+    capability: Option<Capability>,
 ) -> ObfsResult<UdpObfsTransport> {
     let server_addr: SocketAddr = tokio::net::lookup_host(addr).await?
         .next()
@@ -85,7 +93,7 @@ pub async fn connect_udp(
         sock2, server_addr, ch2, out_rx, ev_tx2, pending2, state2,
     ));
 
-    Ok(UdpObfsTransport::new(out_tx, pending, ev_tx, state))
+    Ok(UdpObfsTransport::new(out_tx, pending, ev_tx, state, capability))
 }
 
 /// Background pump task: owns recv + coordinates send.
@@ -191,7 +199,11 @@ impl Requester for UdpObfsTransport {
 impl Subscriber for UdpObfsTransport {
     async fn subscribe(&self, topic: &Topic) -> Result<EventStream> {
         self.outbound_tx
-            .send(Envelope::Subscribe { topic: topic.clone(), filter: None })
+            .send(Envelope::Subscribe {
+                topic: topic.clone(),
+                filter: None,
+                capability: self.capability.clone(),
+            })
             .map_err(|_| CoreError::Disconnected)?;
 
         let mut rx = self.events.subscribe();

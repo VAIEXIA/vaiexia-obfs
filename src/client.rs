@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
+use vaiexia_core::auth::Capability;
 use vaiexia_core::error::{CoreError, Result};
 use vaiexia_core::protocol::{Event, Request, Response, Topic};
 use vaiexia_core::transport::{Connection, ConnectionState, EventStream, Requester, Subscriber};
@@ -51,6 +52,8 @@ pub struct ObfsTransport {
     events: broadcast::Sender<Event>,
     /// Live connection state.
     state: Arc<Mutex<ConnectionState>>,
+    /// Optional capability attached to every `Subscribe` envelope.
+    capability: Option<Capability>,
 }
 
 impl ObfsTransport {
@@ -59,12 +62,15 @@ impl ObfsTransport {
     /// `server_public` is the server's known static public key.
     /// `profile` controls the byte-stream framing; use
     /// `Arc::new(Vanilla::new(Default::default()))` for no obfuscation.
+    /// `capability` is an optional bearer token attached to every `Subscribe`
+    /// envelope so the server can gate per-topic access.
     pub async fn connect(
         addr: impl tokio::net::ToSocketAddrs + std::fmt::Display,
         local_private: [u8; 32],
         server_public: [u8; 32],
         profile: Arc<dyn MimicryProfile>,
         proxy: Option<vaiexia_core::transport::proxy::ProxyConfig>,
+        capability: Option<Capability>,
     ) -> crate::Result<Self> {
         let mut stream = if let Some(proxy_cfg) = proxy {
             let addr_str = addr.to_string();
@@ -99,6 +105,7 @@ impl ObfsTransport {
             pending,
             events: ev_tx,
             state,
+            capability,
         })
     }
 }
@@ -215,11 +222,13 @@ impl Requester for ObfsTransport {
 #[async_trait]
 impl Subscriber for ObfsTransport {
     async fn subscribe(&self, topic: &Topic) -> Result<EventStream> {
-        // Send the Subscribe control message to the server.
+        // Send the Subscribe control message to the server, carrying the
+        // connect-time capability so the server can gate per-topic access.
         self.tx
             .send(Envelope::Subscribe {
                 topic: topic.clone(),
                 filter: None,
+                capability: self.capability.clone(),
             })
             .map_err(|_| CoreError::Disconnected)?;
 

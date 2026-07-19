@@ -209,6 +209,7 @@ async fn proxy_socks5_to_obfs_loopback() {
             server_kp.public,
             vanilla_profile(),
             Some(proxy_cfg),
+            None,
         ),
     )
     .await
@@ -279,6 +280,7 @@ async fn proxy_http_connect_to_obfs_loopback() {
             server_kp.public,
             vanilla_profile(),
             Some(proxy_cfg),
+            None,
         ),
     )
     .await

@@ -11,6 +11,7 @@
 //! - A `SubscribeError` diagnostic from server → client.
 
 use serde::{Deserialize, Serialize};
+use vaiexia_core::auth::Capability;
 use vaiexia_core::diagnostic::Diagnostic;
 use vaiexia_core::protocol::{Event, Request, Response, Topic};
 
@@ -31,6 +32,8 @@ pub enum Envelope {
         topic: Topic,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         filter: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capability: Option<Capability>,
     },
     /// Client → server: unsubscribe from a topic.
     Unsubscribe { topic: Topic },
@@ -116,10 +119,30 @@ mod tests {
         let env = Envelope::Subscribe {
             topic: Topic::new("server.logs"),
             filter: None,
+            capability: None,
         };
         let s = serde_json::to_string(&env).unwrap();
         let back: Envelope = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, Envelope::Subscribe { .. }));
+    }
+
+    #[test]
+    fn subscribe_with_capability_roundtrips() {
+        use vaiexia_core::auth::Capability;
+        let env = Envelope::Subscribe {
+            topic: Topic::new("server.logs"),
+            filter: None,
+            capability: Some(Capability::new("scope:server.logs")),
+        };
+        let s = serde_json::to_string(&env).unwrap();
+        let back: Envelope = serde_json::from_str(&s).unwrap();
+        match back {
+            Envelope::Subscribe { capability, .. } => {
+                assert!(capability.is_some());
+                assert_eq!(capability.unwrap().reveal(), "scope:server.logs");
+            }
+            _ => panic!("expected Subscribe envelope"),
+        }
     }
 
     #[test]

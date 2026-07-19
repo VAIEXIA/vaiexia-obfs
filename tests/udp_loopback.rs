@@ -77,6 +77,7 @@ async fn udp_loopback_passthrough_e2e() {
             server_kp.public,
             client_kp,
             passthrough_profile(),
+            None,
         )
     ).await.expect("connect should not time out").expect("connect should succeed");
 
@@ -145,6 +146,7 @@ async fn udp_loopback_quic_mimic_e2e() {
             server_kp.public,
             client_kp,
             quic_mimic_profile(),
+            None,
         )
     ).await.expect("connect should not time out").expect("connect should succeed");
 
@@ -189,6 +191,7 @@ async fn udp_loopback_cookie_under_load() {
             server_kp.public,
             client_kp,
             passthrough_profile(),
+            None,
         )
     ).await.expect("connect should not time out").expect("cookie path connect should succeed");
 
@@ -224,6 +227,7 @@ async fn udp_loopback_wrong_key_fails() {
             wrong_kp.public, // WRONG key
             client_kp,
             passthrough_profile(),
+            None,
         )
     ).await.expect("should not hang indefinitely");
 
