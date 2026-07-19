@@ -122,13 +122,9 @@ async fn tcp_subscribe_denied_without_capability() {
     // SubscribeError and never wires the broadcast, so the client stream
     // will never see an Ok(event).
     let next = timeout(Duration::from_millis(300), stream.next()).await;
-    match next {
-        Ok(Some(Ok(ev))) => panic!(
-            "denied subscription must not deliver events; got seq {}",
-            ev.seq.0
-        ),
-        // Timeout (no event) or Err variant both satisfy the test.
-        _ => {}
+    // Timeout (no event) or Err variant both satisfy the test; only an Ok event is a failure.
+    if let Ok(Some(Ok(ev))) = next {
+        panic!("denied subscription must not deliver events; got seq {}", ev.seq.0);
     }
 }
 
@@ -246,12 +242,9 @@ async fn udp_subscribe_denied_without_capability() {
     let _ = event_tx.send(ev);
 
     let next = timeout(Duration::from_millis(300), stream.next()).await;
-    match next {
-        Ok(Some(Ok(ev))) => panic!(
-            "denied UDP subscription must not deliver events; got seq {}",
-            ev.seq.0
-        ),
-        _ => {}
+    // Timeout (no event) or Err variant both satisfy the test; only an Ok event is a failure.
+    if let Ok(Some(Ok(ev))) = next {
+        panic!("denied UDP subscription must not deliver events; got seq {}", ev.seq.0);
     }
 }
 

@@ -18,6 +18,8 @@ use rand::{SeedableRng, rngs::SmallRng};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use vaiexia_core::diagnostic::{codes, Diagnostic};
+use vaiexia_core::error::CoreError;
 use vaiexia_core::protocol::Topic;
 use vaiexia_core::server::Service;
 use vaiexia_wire::mimicry::MimicryProfile;
@@ -177,8 +179,39 @@ async fn handle_connection(
                             break;
                         }
                     }
-                    Ok(Envelope::Subscribe { topic, .. }) => {
-                        handle_subscribe(&service, topic, event_tx.clone());
+                    Ok(Envelope::Subscribe { topic, capability, .. }) => {
+                        // Gate per-topic access before wiring the event source,
+                        // mirroring core's ws_conn behaviour.
+                        match service.verify_topic(capability.as_ref(), &topic) {
+                            Err(err) => {
+                                let diag = match err {
+                                    CoreError::Auth(d) => d,
+                                    _ => Diagnostic::error(
+                                        codes::FORBIDDEN,
+                                        "subscription denied",
+                                    ),
+                                };
+                                let delay = profile.jitter(&mut rng);
+                                if !delay.is_zero() {
+                                    tokio::time::sleep(delay).await;
+                                }
+                                if send_frame(
+                                    &mut stream,
+                                    &mut session,
+                                    &Envelope::SubscribeError { topic, error: diag },
+                                    profile.as_ref(),
+                                    &mut rng,
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(_subject) => {
+                                handle_subscribe(&service, topic, event_tx.clone());
+                            }
+                        }
                     }
                     Ok(Envelope::Unsubscribe { .. }) => {
                         // Full unsubscribe tracking is future work.

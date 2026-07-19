@@ -18,6 +18,8 @@ use crate::udp::handshake::{
 use crate::udp::wire_dgram::{DgramType, decode_inner};
 use crate::verifier::TransportGate;
 use crate::Result;
+use vaiexia_core::diagnostic::{codes, Diagnostic};
+use vaiexia_core::error::CoreError;
 
 const MAX_DGRAM: usize = 65507;
 const MAX_PEERS: usize = 1024;
@@ -296,22 +298,42 @@ async fn handle_dgram(
                         let _ = sock.send_to(&wire, src).await;
                     }
                 }
-                Envelope::Subscribe { topic, .. } => {
-                    if let Some(event_src) = svc.event_source(&topic) {
-                        let mut rx = event_src.subscribe();
-                        let topic_clone = topic.clone();
-                        tokio::spawn(async move {
-                            loop {
-                                match rx.recv().await {
-                                    Ok(ev) if ev.topic == topic_clone => {
-                                        if ev_tx.send(Envelope::Event(ev)).is_err() { break; }
+                Envelope::Subscribe { topic, capability, .. } => {
+                    // Gate per-topic access before wiring the event source,
+                    // mirroring core's ws_conn behaviour.
+                    match svc.verify_topic(capability.as_ref(), &topic) {
+                        Err(err) => {
+                            let diag = match err {
+                                CoreError::Auth(d) => d,
+                                _ => Diagnostic::error(
+                                    codes::FORBIDDEN,
+                                    "subscription denied",
+                                ),
+                            };
+                            // Best-effort: send error back to the peer.
+                            let _ = ev_tx.send(Envelope::SubscribeError {
+                                topic,
+                                error: diag,
+                            });
+                        }
+                        Ok(_subject) => {
+                            if let Some(event_src) = svc.event_source(&topic) {
+                                let mut rx = event_src.subscribe();
+                                let topic_clone = topic.clone();
+                                tokio::spawn(async move {
+                                    loop {
+                                        match rx.recv().await {
+                                            Ok(ev) if ev.topic == topic_clone => {
+                                                if ev_tx.send(Envelope::Event(ev)).is_err() { break; }
+                                            }
+                                            Ok(_) => {}
+                                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                            Err(_) => break,
+                                        }
                                     }
-                                    Ok(_) => {}
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                                    Err(_) => break,
-                                }
+                                });
                             }
-                        });
+                        }
                     }
                 }
                 Envelope::Unsubscribe { .. } => {}
